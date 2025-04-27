@@ -1,4 +1,4 @@
-# lambda/index.py
+# lambda/index.py  ––– Colab FastAPI (urllib) 版
 import json
 import os
 import re
@@ -7,73 +7,89 @@ from urllib import request, error, parse
 
 # ───────────────────────────────────────────────
 # 環境変数
-#   ・COLAB_BASE_URL : 例 "https://xxx-xxxx.ngrok-free.app"
-#   ・COLAB_API_KEY  : Bearer 認証が必要な場合のみ
+#   COLAB_BASE_URL : 例 "https://xxx-xxx.ngrok-free.app"   (必須)
+#   COLAB_API_KEY  : Bearer 認証が必要な場合のみ           (任意)
 # ───────────────────────────────────────────────
-COLAB_BASE_URL = os.environ["COLAB_BASE_URL"].rstrip("/")          # 必須
-#COLAB_API_KEY  = os.getenv("COLAB_API_KEY")                        # 任意
-GENERATE_PATH  = "/generate"                                       # FastAPI 側エンドポイント
+try:
+    COLAB_BASE_URL = os.environ["COLAB_BASE_URL"].rstrip("/")
+except KeyError:
+    raise RuntimeError("環境変数 COLAB_BASE_URL が設定されていません")
+COLAB_API_KEY = os.getenv("COLAB_API_KEY") or None   # 無ければ None
+
+GENERATE_PATH = "/generate"
+HEALTH_PATH   = "/health"
 
 # ───────────────────────────────────────────────
-# Lambda ARN からリージョンを抜き取る（ログ用）
-# ───────────────────────────────────────────────
 def extract_region_from_arn(arn: str) -> str:
+    """ARN からリージョン名を抽出（ログ用）"""
     m = re.search(r"arn:aws:lambda:([^:]+):", arn)
     return m.group(1) if m else "us-east-1"
 
 # ───────────────────────────────────────────────
-# Lambda ハンドラ
+def _build_request(url: str, payload: dict | None = None) -> request.Request:
+    """urllib.request.Request を作成"""
+    data = json.dumps(payload).encode("utf-8") if payload else None
+    req  = request.Request(url, data=data, method="POST" if data else "GET")
+    req.add_header("Content-Type", "application/json")
+    if COLAB_API_KEY:
+        req.add_header("Authorization", f"Bearer {COLAB_API_KEY}")
+    return req
+
+# ───────────────────────────────────────────────
+def _call_fastapi(path: str, payload: dict | None = None, timeout: int = 30):
+    """FastAPI にリクエストを送り、結果を JSON で返す"""
+    url = parse.urljoin(COLAB_BASE_URL, path)
+    req = _build_request(url, payload)
+    with request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
 # ───────────────────────────────────────────────
 def lambda_handler(event, context):
-    try:
-        region = extract_region_from_arn(context.invoked_function_arn)
-        print(f"[Lambda][{region}] Event: {json.dumps(event)[:400]}")
+    region = extract_region_from_arn(context.invoked_function_arn)
+    print(f"[Lambda][{region}] Event: {json.dumps(event)[:400]}")
 
-        # ───────── フロントから受け取った内容 ─────────
+    # 1️⃣ FastAPI /health へ簡易疎通チェック（失敗しても本処理続行）
+    try:
+        health = _call_fastapi(HEALTH_PATH, payload=None, timeout=5)
+        print(f"[Lambda] /health OK: {health}")
+    except Exception as e:
+        print(f"[Lambda] /health NG: {e}")
+
+    try:
+        # ───── フロントエンドからの入力 ─────
         body        = json.loads(event["body"])
         user_msg    = body["message"]
         history     = body.get("conversationHistory", [])
 
-        # ───────── 会話履歴を 1 本のプロンプトへ ─────────
-        prompt_parts = [
-            f"{m['role'].capitalize()}: {m['content']}" for m in history
-        ]
+        # ───── プロンプト組み立て ─────
+        prompt_parts = [f"{m['role'].capitalize()}: {m['content']}" for m in history]
         prompt_parts.append(f"User: {user_msg}\nAssistant:")
         prompt_text = "\n".join(prompt_parts)
 
-        # ───────── FastAPI へ送るペイロード ─────────
         payload = {
-            "prompt":           prompt_text,
-            "max_new_tokens":   512,
-            "temperature":      0.7,
-            "top_p":            0.9,
-            "do_sample":        True
+            "prompt":         prompt_text,
+            "max_new_tokens": 512,
+            "temperature":    0.7,
+            "top_p":          0.9,
+            "do_sample":      True,
         }
-        data = json.dumps(payload).encode("utf-8")
 
-        # ───────── HTTP リクエスト作成 ─────────
-        url = parse.urljoin(COLAB_BASE_URL, GENERATE_PATH)
-        req = request.Request(url, data=data, method="POST")
-        req.add_header("Content-Type", "application/json")
-        if COLAB_API_KEY:
-            req.add_header("Authorization", f"Bearer {COLAB_API_KEY}")
+        print(f"[Lambda] POST → {COLAB_BASE_URL + GENERATE_PATH}")
 
-        print(f"[Lambda] POST → {url}")
+        # ───── 推論リクエスト ─────
+        t0 = time.time()
+        result = _call_fastapi(GENERATE_PATH, payload, timeout=60)
+        elapsed = time.time() - t0
 
-        # ───────── 送信 & 受信 ─────────
-        start = time.time()
-        with request.urlopen(req, timeout=60) as resp:
-            resp_body = resp.read().decode("utf-8")
-        elapsed = time.time() - start
-
-        result = json.loads(resp_body)
         assistant_reply = result.get("generated_text")
         if not assistant_reply:
-            raise ValueError("FastAPI から 'generated_text' が返りませんでした。")
+            raise ValueError("FastAPI から 'generated_text' が返りませんでした")
 
-        print(f"[Lambda] FastAPI resp_time={result['response_time']:.2f}s  total={elapsed:.2f}s")
+        print(
+            f"[Lambda] FastAPI resp_time={result['response_time']:.2f}s "
+            f"total={elapsed:.2f}s"
+        )
 
-        # ───────── 履歴更新 & 正常レスポンス ─────────
         history.append({"role": "assistant", "content": assistant_reply})
         return {
             "statusCode": 200,
@@ -81,45 +97,39 @@ def lambda_handler(event, context):
                 "Content-Type": "application/json",
                 "Access-Control-Allow-Origin": "*",
                 "Access-Control-Allow-Headers": "Content-Type,Authorization",
-                "Access-Control-Allow-Methods": "OPTIONS,POST"
+                "Access-Control-Allow-Methods": "OPTIONS,POST",
             },
-            "body": json.dumps({
-                "success": True,
-                "response": assistant_reply,
-                "conversationHistory": history
-            })
+            "body": json.dumps(
+                {
+                    "success": True,
+                    "response": assistant_reply,
+                    "conversationHistory": history,
+                }
+            ),
         }
 
-    # ───────── 例外ハンドリング ─────────
+    # ───── 例外ハンドリング ─────
     except error.HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="ignore")
-        err_msg  = f"HTTPError {e.code}: {err_body}"
-        print(f"[Lambda][ERROR] {err_msg}")
-        return _error_response(err_msg)
+        body = e.read().decode("utf-8", errors="ignore")
+        return _error_response(f"HTTPError {e.code}: {body}")
 
     except error.URLError as e:
-        err_msg = f"URLError: {e.reason}"
-        print(f"[Lambda][ERROR] {err_msg}")
-        return _error_response(err_msg)
+        return _error_response(f"URLError: {e.reason}")
 
     except Exception as e:
-        err_msg = str(e)
-        print(f"[Lambda][ERROR] {err_msg}")
-        return _error_response(err_msg)
+        return _error_response(str(e))
 
-
-# ───────────────────────────────────────────────
-# 汎用エラーレスポンス
 # ───────────────────────────────────────────────
 def _error_response(message: str):
+    """共通 500 レスポンス"""
+    print(f"[Lambda][ERROR] {message}")
     return {
         "statusCode": 500,
         "headers": {
             "Content-Type": "application/json",
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Headers": "Content-Type,Authorization",
-            "Access-Control-Allow-Methods": "OPTIONS,POST"
+            "Access-Control-Allow-Methods": "OPTIONS,POST",
         },
-        "body": json.dumps({"success": False, "error": message})
+        "body": json.dumps({"success": False, "error": message}),
     }
-
